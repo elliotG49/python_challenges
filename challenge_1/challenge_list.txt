@@ -1,0 +1,27 @@
+Challenges:
+Basic Challenges:
+Count Lines: Write a function to count the total number of lines in the file.
+Extract Facts: Extract and print only the facts (lines starting with a number).
+Sum Numbers: Calculate the sum of all numbers in the "Random Numbers" section.
+Valid Emails: Extract all valid email addresses from the "Contact List" section.
+
+Intermediate Challenges:
+Most Common Letter: Find the most common letter in the file (ignoring case).
+Sort Numbers: Sort the numbers in the "Random Numbers" section in descending order.
+Count Words: Count the total number of words in the file, excluding special characters.
+Parse JSON: Parse the JSON data to extract the list of project names.
+
+Advanced Challenges:
+Phone Number Formatter: Convert all phone numbers in the "Contact List" to the format +1-XXX-XXX-XXXX.
+Word Frequency: Count the frequency of each word in the file and output the top 5 most common words.
+Obfuscate Emails: Replace all emails in the "Contact List" with obfuscated versions (e.g., alice[at]example[dot]com).
+
+Project Challenge:
+File Summary Report: Create a Python program that generates a summary report of the file. The report should include:
+Total number of lines.
+Total number of words.
+Count of unique words.
+Total sum of all numbers in the file.
+List of all facts.
+List of unique email addresses and phone numbers.
+Parsed JSON data as a Python dictionary.

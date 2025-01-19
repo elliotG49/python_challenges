@@ -1,0 +1,9 @@
+{
+    "company": "TechWorld",
+    "employees": [
+        {"name": "Alice", "role": "Developer"},
+        {"name": "Bob", "role": "Designer"},
+        {"name": "Charlie", "role": "Manager"}
+    ],
+    "projects": ["Alpha", "Beta", "Gamma"]
+}
