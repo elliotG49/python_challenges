@@ -36,13 +36,16 @@ def challenge_1():
         df = pd.merge(departments_df, employees_df, left_on='department_id', right_on='id', how='left')
         
         df = pd.merge(df, projects_df, left_on='department_id', right_on='department_id', how='left')
-        df.rename(columns={'name_x': 'department_name', 'name_y': 'employee_name', 'name': 'project_name'}, inplace=True)
+        df.rename(columns={'name_x': 'department_name', 'name_y': 'employee_name', 'name': 'project_name', 'role': 'employee_role'}, inplace=True)
         df = df.drop(columns=['id'])
+        df.loc[df['employee_name'] == 'Alice', 'employee_name'] = 'Jane'
+        
         cols = list(df.columns)
-        # df = df[cols[2:3] + [cols[0:1]] + cols[4:5]]
-        print(cols[4:6])
-        managers = df.loc[df['role'] == 'Manager']
-        # print(managers['employee_name'])
+        for i,col in enumerate(cols):
+            print(f'Index: {i}, Column-Name: {col}')
+        df = df[cols[2:4] + cols[0:2] + cols[4::]]
+        managers = df.loc[df['employee_role'] == 'Manager']
+        print(df, managers['employee_name'].tolist())
 
         
         
