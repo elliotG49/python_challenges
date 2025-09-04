@@ -27,6 +27,10 @@ class VehicleDetectionTracker:
         self.model_classifier = None
         self.vehicle_timestamps = defaultdict(list)  # Keep track of timestamps for each tracked vehicle
 
+        # NEW: caches so we can annotate skipped frames without re-running the model
+        self._last_dets = []          # list of dicts: {cx, cy, w, h, cls, conf, tid}
+        self._names_cache = None      # class names from last inference
+
 
     def _initialize_classifiers(self):
         if self.color_classifier is None:
@@ -35,7 +39,6 @@ class VehicleDetectionTracker:
             self.model_classifier = ModelClassifier()
 
     def _map_direction_to_label(self, direction):
-        # Define direction ranges in radians and their corresponding labels
         direction_ranges = {
             (-math.pi / 8, math.pi / 8): "Right",
             (math.pi / 8, 3 * math.pi / 8): "Bottom Right",
@@ -49,77 +52,66 @@ class VehicleDetectionTracker:
         for angle_range, label in direction_ranges.items():
             if angle_range[0] <= direction <= angle_range[1]:
                 return label
-        return "Unknown"  # Return "Unknown" if the direction doesn't match any defined range
-
+        return "Unknown"
 
     def _encode_image_base64(self, image):
-        """
-        Encode an image as base64.
-
-        Args:
-            image (numpy.ndarray): The image to be encoded.
-
-        Returns:
-            str: Base64-encoded image.
-        """
         _, buffer = cv2.imencode('.jpg', image)
         image_base64 = base64.b64encode(buffer).decode()
         return image_base64
     
     def _decode_image_base64(self, image_base64):
-        """
-        Decode a base64-encoded image.
-
-        Args:
-            image_base64 (str): Base64-encoded image data.
-
-        Returns:
-            numpy.ndarray or None: Decoded image as a numpy array or None if decoding fails.
-        """
         try:
             image_data = base64.b64decode(image_base64)
             image_np = np.frombuffer(image_data, dtype=np.uint8)
             image = cv2.imdecode(image_np, flags=cv2.IMREAD_COLOR)
             return image
-        except Exception as e:
+        except Exception:
             return None
         
     def _increase_brightness(self, image, factor=1.5):
-        """
-        Increases the brightness of an image by multiplying its pixels by a factor.
-
-        :param image: The input image in numpy array format.
-        :param factor: The brightness increase factor. A value greater than 1 will increase brightness.
-        :return: The image with increased brightness.
-        """
-        brightened_image = cv2.convertScaleAbs(image, alpha=factor, beta=0)
-        return brightened_image
+        return cv2.convertScaleAbs(image, alpha=factor, beta=0)
 
     def _convert_meters_per_second_to_kmph(self, meters_per_second):
-        # 1 m/s is approximately 3.6 km/h
-        kmph = meters_per_second * 3.6
-        return kmph
+        return meters_per_second * 3.6
 
-    def process_frame_base64(self, frame_base64, frame_timestamp):
-        """
-        Process a base64-encoded frame to detect and track vehicles.
-
-        Args:
-            frame_base64 (str): Base64-encoded input frame for processing.
-
-        Returns:
-            dict or None: Processed information including tracked vehicles' details and the annotated frame in base64,
-            or an error message if decoding fails.
-        """
+    def process_frame_base64(self, frame_base64, frame_timestamp, run_inference=True):
         frame = self._decode_image_base64(frame_base64)
         if frame is not None:
-            return self.process_frame(frame, frame_timestamp)
+            return self.process_frame(frame, frame_timestamp, run_inference=run_inference)
         else:
-            return {
-                "error": "Failed to decode the base64 image"
-            }
+            return {"error": "Failed to decode the base64 image"}
             
-    def process_frame(self, frame, frame_timestamp):
+    def _annotate_from_cached_dets(self, frame):
+        """
+        Draw boxes/labels on the given frame using self._last_dets and self._names_cache.
+        No tracker update; just a quick overlay for skipped frames.
+        """
+        annotated_frame = frame.copy()
+        annotated_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+        annotator = Annotator(annotated_frame, line_width=2, font_size=14, pil=False)
+        if self._last_dets and self._names_cache:
+            H, W = frame.shape[:2]
+            for det in self._last_dets:
+                cx, cy, w, h = det["cx"], det["cy"], det["w"], det["h"]
+                cls, conf, tid = det["cls"], det["conf"], det["tid"]
+
+                # clamp and draw
+                x1 = int(max(0, cx - w/2)); y1 = int(max(0, cy - h/2))
+                x2 = int(min(W, cx + w/2)); y2 = int(min(H, cy + h/2))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                id_text = f"ID:{tid}" if tid is not None else "ID:-"
+                label = f"{self._names_cache[int(cls)]} {conf:.2f} {id_text}"
+                annotator.box_label([x1, y1, x2, y2], label, color=colors(int(cls), True))
+
+        annotated_frame = annotator.result()
+        annotated_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_RGB2BGR)
+        return annotated_frame
+
+    def process_frame(self, frame, frame_timestamp, run_inference=True):
+        """
+        If run_inference is False, we skip YOLO/ByteTrack and just redraw the last detections.
+        """
         self._initialize_classifiers()
 
         response = {
@@ -127,41 +119,82 @@ class VehicleDetectionTracker:
             "detected_vehicles": []
         }
 
-        # 1) Detect on a brightened copy for better low-light recall
+        # SKIPPED FRAME: reuse last detections for fast overlay
+        if not run_inference:
+            annotated_frame = self._annotate_from_cached_dets(frame)
+            response["annotated_frame"] = annotated_frame
+            response["original_frame"] = frame
+
+            # We also echo back the last known detections (no new classifications on skipped frames)
+            for det in self._last_dets:
+                response["number_of_vehicles_detected"] += 1
+                response["detected_vehicles"].append({
+                    "vehicle_id": det["tid"],
+                    "vehicle_type": str(self._names_cache[int(det["cls"])]) if self._names_cache else "unknown",
+                    "detection_confidence": float(det["conf"]),
+                    "vehicle_coordinates": {
+                        "x": float(det["cx"]), "y": float(det["cy"]),
+                        "width": float(det["w"]), "height": float(det["h"])
+                    },
+                    # no fresh crops/classification on skipped frames, keep from last or empty
+                    "color_info": det.get("color_info", "{}"),
+                    "model_info": det.get("model_info", "{}")
+                })
+            return response
+
+        # INFERENCE FRAME: full YOLO + tracker
         bright = self._increase_brightness(frame)
         results = self.model.track(bright, persist=True, tracker="bytetrack.yaml")
 
-        # 2) Draw on the ORIGINAL frame (so the annotated video doesn’t look washed out)
         annotated_frame = frame.copy()
-        annotator = Annotator(annotated_frame, line_width=2, font_size=14, pil=True)  # tweak font_size as you like
+        annotator = Annotator(annotated_frame, line_width=2, font_size=14, pil=False)
+
+        # reset cache for this frame
+        self._last_dets = []
+        self._names_cache = None
 
         if results and results[0] and results[0].boxes is not None:
             r0 = results[0]
             names = r0.names
+            self._names_cache = names
 
             # (a) For box labels we want xyxy
             xyxy = r0.boxes.xyxy.cpu().numpy()
             confs = r0.boxes.conf.cpu().tolist()
             clss  = r0.boxes.cls.cpu().tolist()
-
-            # Draw labeled boxes on the original frame
-            for box, cls, conf in zip(xyxy, clss, confs):
-                label = f"{names[int(cls)]} {float(conf):.2f}"
-                annotator.box_label(box, label, color=colors(int(cls), True))
-
-            # (b) For tracks & cropping we want centers + IDs
+            
             xywh      = r0.boxes.xywh.cpu().numpy()
             track_ids = r0.boxes.id
             track_ids = track_ids.int().cpu().tolist() if track_ids is not None else [None] * len(clss)
 
+            # Draw labeled boxes on the original frame
+            allowed_classes = {"bus", "truck", "car", "bicycle", "motorcycle"}
+
+            for box, cls, conf, tid in zip(xyxy, clss, confs, track_ids):
+                cls_name = names[int(cls)]
+                if cls_name not in allowed_classes:
+                    continue
+                id_text = f"ID:{tid}" if tid is not None else "ID:-"
+                label = f"{cls_name} {conf:.2f} {id_text}"
+                annotator.box_label(box, label, color=colors(int(cls), True))
+
+
             # Finalize Annotator -> NumPy (RGB) then convert to BGR for OpenCV ops
             annotated_frame = annotator.result()
-            annotated_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_RGB2BGR)
+            # annotated_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_RGB2BGR)
 
             # 3) Polylines + crops/classification from ORIGINAL frame
             H, W = frame.shape[:2]
 
+            allowed_classes = {"bus", "truck", "car", "bicycle", "motorcycle"}
+            
             for (cx, cy, w, h), cls, conf, tid in zip(xywh, clss, confs, track_ids):
+                cls_name = names[int(cls)]
+                if cls_name not in allowed_classes:
+                    continue
+                id_text = f"ID:{tid}" if tid is not None else "ID:-"
+                label = f"{cls_name} {conf:.2f} {id_text}"
+                annotator.box_label(box, label, color=colors(int(cls), True))
                 # Update per-track history and draw trajectory if we have an ID
                 if tid is not None:
                     trk = self.track_history[tid]
@@ -191,7 +224,7 @@ class VehicleDetectionTracker:
 
                 # Build response item
                 response["number_of_vehicles_detected"] += 1
-                response["detected_vehicles"].append({
+                item = {
                     "vehicle_id": tid,  # may be None on first few frames before tracker locks
                     "vehicle_type": str(names[int(cls)]),
                     "detection_confidence": float(conf),
@@ -201,19 +234,27 @@ class VehicleDetectionTracker:
                     },
                     "color_info": json.dumps(color_info),
                     "model_info": json.dumps(model_info)
+                }
+                response["detected_vehicles"].append(item)
+
+                # Cache minimal det info for skipped frames
+                self._last_dets.append({
+                    "cx": float(cx), "cy": float(cy), "w": float(w), "h": float(h),
+                    "cls": int(cls), "conf": float(conf), "tid": tid,
+                    "color_info": json.dumps(color_info),
+                    "model_info": json.dumps(model_info)
                 })
 
-        # 4) Return both frames (np arrays)
         response["annotated_frame"] = annotated_frame
         response["original_frame"]  = frame
         return response
 
     
     def process_video(self, video_path, result_callback=None,
-                    output_path="output_annotated.mp4",
-                    show_preview=False,
-                    resize_to=None,  
-                    scale=None):      
+                      output_path="output_annotated.mp4",
+                      show_preview=False,
+                      resize_to=None,  
+                      scale=None):      
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise RuntimeError(f"Could not open video: {video_path}")
@@ -225,7 +266,6 @@ class VehicleDetectionTracker:
         import time
         t0 = time.perf_counter(); frames = 0
         frame_idx = 0
-        video_t0 = datetime.now()  # only used to form a monotonic datetime for process_frame if needed
 
         while True:
             ok, frame = cap.read()
@@ -239,12 +279,12 @@ class VehicleDetectionTracker:
                 
             video_time_seconds = frame_idx / fps
 
+            # NEW: run model every 2 frames (even frames)
+            run_inference = (frame_idx % 3 == 0)
 
-            response = self.process_frame(frame, datetime.now())
+            response = self.process_frame(frame, datetime.now(), run_inference=run_inference)
             response["frame_index"] = frame_idx
             response["video_time_seconds"] = video_time_seconds
-
-            
 
             annotated = response.get("annotated_frame")
             if annotated is not None:
@@ -258,7 +298,7 @@ class VehicleDetectionTracker:
                 writer.write(annotated)
 
                 if show_preview:
-                    cv2.imshow("YOLOv8 + ByteTrack", annotated)
+                    cv2.imshow("YOLOv8 + ByteTrack (stride=2)", annotated)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
 
@@ -267,13 +307,13 @@ class VehicleDetectionTracker:
 
             # simple FPS meter
             frames += 1
-            print(f'---------frame-------')
+            print('---------frame-------')
             print(frames)
             if frames % 60 == 0:
                 dt = time.perf_counter() - t0
                 print(f"~FPS: {frames/dt:.1f}")
                 t0 = time.perf_counter(); frames = 0
-            frame_idx +=1
+            frame_idx += 1
 
         cap.release()
         if writer is not None:
