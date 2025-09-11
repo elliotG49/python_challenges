@@ -9,6 +9,10 @@ from ultralytics.utils.plotting import colors, Annotator
 from VehicleDetectionTracker.color_classifier.classifier import Classifier as ColorClassifier
 from VehicleDetectionTracker.model_classifier.classifier import Classifier as ModelClassifier
 from datetime import datetime, timedelta
+import pytesseract
+
+
+
 
 class VehicleDetectionTracker:
 
@@ -25,11 +29,9 @@ class VehicleDetectionTracker:
         self.detected_vehicles = set()  # Set of detected vehicles
         self.color_classifier = None
         self.model_classifier = None
+        self.license_plate_model = YOLO(license_plate_model_path)  # NEW
         self.vehicle_timestamps = defaultdict(list)  # Keep track of timestamps for each tracked vehicle
-
-        # NEW: caches so we can annotate skipped frames without re-running the model
-        self._last_dets = []          # list of dicts: {cx, cy, w, h, cls, conf, tid}
-        self._names_cache = None      # class names from last inference
+        
 
 
     def _initialize_classifiers(self):
@@ -37,22 +39,6 @@ class VehicleDetectionTracker:
             self.color_classifier = ColorClassifier()
         if self.model_classifier is None:
             self.model_classifier = ModelClassifier()
-
-    def _map_direction_to_label(self, direction):
-        direction_ranges = {
-            (-math.pi / 8, math.pi / 8): "Right",
-            (math.pi / 8, 3 * math.pi / 8): "Bottom Right",
-            (3 * math.pi / 8, 5 * math.pi / 8): "Bottom",
-            (5 * math.pi / 8, 7 * math.pi / 8): "Bottom Left",
-            (7 * math.pi / 8, -7 * math.pi / 8): "Left",
-            (-7 * math.pi / 8, -5 * math.pi / 8): "Top Left",
-            (-5 * math.pi / 8, -3 * math.pi / 8): "Top",
-            (-3 * math.pi / 8, -math.pi / 8): "Top Right"
-        }
-        for angle_range, label in direction_ranges.items():
-            if angle_range[0] <= direction <= angle_range[1]:
-                return label
-        return "Unknown"
 
     def _encode_image_base64(self, image):
         _, buffer = cv2.imencode('.jpg', image)
@@ -71,8 +57,12 @@ class VehicleDetectionTracker:
     def _increase_brightness(self, image, factor=1.5):
         return cv2.convertScaleAbs(image, alpha=factor, beta=0)
 
-    def _convert_meters_per_second_to_kmph(self, meters_per_second):
-        return meters_per_second * 3.6
+    def _read_license_plate(self, lp_image):
+        gray = cv2.cvtColor(lp_image, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 64, 255, cv2.THRESH_BINARY_INV)
+        text = pytesseract.image_to_string(thresh, config="--psm 7")
+        text = text.strip()
+        return text if text else None
 
     def process_frame_base64(self, frame_base64, frame_timestamp, run_inference=True):
         frame = self._decode_image_base64(frame_base64)
@@ -80,33 +70,6 @@ class VehicleDetectionTracker:
             return self.process_frame(frame, frame_timestamp, run_inference=run_inference)
         else:
             return {"error": "Failed to decode the base64 image"}
-            
-    def _annotate_from_cached_dets(self, frame):
-        """
-        Draw boxes/labels on the given frame using self._last_dets and self._names_cache.
-        No tracker update; just a quick overlay for skipped frames.
-        """
-        annotated_frame = frame.copy()
-        annotated_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-        annotator = Annotator(annotated_frame, line_width=2, font_size=14, pil=False)
-        if self._last_dets and self._names_cache:
-            H, W = frame.shape[:2]
-            for det in self._last_dets:
-                cx, cy, w, h = det["cx"], det["cy"], det["w"], det["h"]
-                cls, conf, tid = det["cls"], det["conf"], det["tid"]
-
-                # clamp and draw
-                x1 = int(max(0, cx - w/2)); y1 = int(max(0, cy - h/2))
-                x2 = int(min(W, cx + w/2)); y2 = int(min(H, cy + h/2))
-                if x2 <= x1 or y2 <= y1:
-                    continue
-                id_text = f"ID:{tid}" if tid is not None else "ID:-"
-                label = f"{self._names_cache[int(cls)]} {conf:.2f} {id_text}"
-                annotator.box_label([x1, y1, x2, y2], label, color=colors(int(cls), True))
-
-        annotated_frame = annotator.result()
-        annotated_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_RGB2BGR)
-        return annotated_frame
 
     def process_frame(self, frame, frame_timestamp, run_inference=True):
         """
@@ -119,28 +82,6 @@ class VehicleDetectionTracker:
             "detected_vehicles": []
         }
 
-        # SKIPPED FRAME: reuse last detections for fast overlay
-        if not run_inference:
-            annotated_frame = self._annotate_from_cached_dets(frame)
-            response["annotated_frame"] = annotated_frame
-            response["original_frame"] = frame
-
-            # We also echo back the last known detections (no new classifications on skipped frames)
-            for det in self._last_dets:
-                response["number_of_vehicles_detected"] += 1
-                response["detected_vehicles"].append({
-                    "vehicle_id": det["tid"],
-                    "vehicle_type": str(self._names_cache[int(det["cls"])]) if self._names_cache else "unknown",
-                    "detection_confidence": float(det["conf"]),
-                    "vehicle_coordinates": {
-                        "x": float(det["cx"]), "y": float(det["cy"]),
-                        "width": float(det["w"]), "height": float(det["h"])
-                    },
-                    # no fresh crops/classification on skipped frames, keep from last or empty
-                    "color_info": det.get("color_info", "{}"),
-                    "model_info": det.get("model_info", "{}")
-                })
-            return response
 
         # INFERENCE FRAME: full YOLO + tracker
         bright = self._increase_brightness(frame)
@@ -149,14 +90,9 @@ class VehicleDetectionTracker:
         annotated_frame = frame.copy()
         annotator = Annotator(annotated_frame, line_width=2, font_size=14, pil=False)
 
-        # reset cache for this frame
-        self._last_dets = []
-        self._names_cache = None
-
         if results and results[0] and results[0].boxes is not None:
             r0 = results[0]
             names = r0.names
-            self._names_cache = names
 
             # (a) For box labels we want xyxy
             xyxy = r0.boxes.xyxy.cpu().numpy()
@@ -166,14 +102,9 @@ class VehicleDetectionTracker:
             xywh      = r0.boxes.xywh.cpu().numpy()
             track_ids = r0.boxes.id
             track_ids = track_ids.int().cpu().tolist() if track_ids is not None else [None] * len(clss)
-
-            # Draw labeled boxes on the original frame
-            allowed_classes = {"bus", "truck", "car", "bicycle", "motorcycle"}
-
+  
             for box, cls, conf, tid in zip(xyxy, clss, confs, track_ids):
                 cls_name = names[int(cls)]
-                if cls_name not in allowed_classes:
-                    continue
                 id_text = f"ID:{tid}" if tid is not None else "ID:-"
                 label = f"{cls_name} {conf:.2f} {id_text}"
                 annotator.box_label(box, label, color=colors(int(cls), True))
@@ -185,13 +116,9 @@ class VehicleDetectionTracker:
 
             # 3) Polylines + crops/classification from ORIGINAL frame
             H, W = frame.shape[:2]
-
-            allowed_classes = {"bus", "truck", "car", "bicycle", "motorcycle"}
             
             for (cx, cy, w, h), cls, conf, tid in zip(xywh, clss, confs, track_ids):
                 cls_name = names[int(cls)]
-                if cls_name not in allowed_classes:
-                    continue
                 id_text = f"ID:{tid}" if tid is not None else "ID:-"
                 label = f"{cls_name} {conf:.2f} {id_text}"
                 annotator.box_label(box, label, color=colors(int(cls), True))
@@ -210,6 +137,8 @@ class VehicleDetectionTracker:
                 x2 = int(cx + w / 2); y2 = int(cy + h / 2)
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(W, x2), min(H, y2)
+                
+                
 
                 if x2 <= x1 or y2 <= y1:
                     continue  # degenerate box after clamping
@@ -217,11 +146,36 @@ class VehicleDetectionTracker:
                 vehicle_frame = frame[y1:y2, x1:x2]
                 if vehicle_frame.size == 0:
                     continue
+                
+                lp_results = self.license_plate_model(vehicle_frame)[0]
+                license_plate_data = []
+                for lp_box in lp_results.boxes.data.tolist():
+                    vx1, vy1, vx2, vy2, score, class_id = lp_box
+                    # Convert coords to original frame
+                    full_x1 = int(x1 + vx1)
+                    full_y1 = int(y1 + vy1)
+                    full_x2 = int(x1 + vx2)
+                    full_y2 = int(y1 + vy2)
+                    
+                    # Crop the plate region from the original frame (optional)
+                    lp_crop = frame[full_y1:full_y2, full_x1:full_x2]
+                    lp_text = self._read_license_plate(lp_crop)
+                    lp_crop_b64 = self._encode_image_base64(lp_crop)
 
+                    license_plate_data.append({
+                        "bbox": [full_x1, full_y1, full_x2, full_y2],  # full-frame coordinates
+                        "text": lp_text,
+                        "confidence": score,
+                        "crop_base64": lp_crop_b64
+                    })
+                                
+                vehicle_frame_base64 = self._encode_image_base64(vehicle_frame)
                 # Classifiers
                 color_info = self.color_classifier.predict(vehicle_frame)
                 model_info = self.model_classifier.predict(vehicle_frame)
+                
 
+                
                 # Build response item
                 response["number_of_vehicles_detected"] += 1
                 item = {
@@ -232,29 +186,46 @@ class VehicleDetectionTracker:
                         "x": float(cx), "y": float(cy),
                         "width": float(w), "height": float(h)
                     },
+                    "vehicle_frame_base64": vehicle_frame_base64,
                     "color_info": json.dumps(color_info),
                     "model_info": json.dumps(model_info)
                 }
+                
+                matched_plate = None
+                for lp in license_plate_data:
+                    lp_x1, lp_y1, lp_x2, lp_y2 = lp["bbox"]
+
+                    # Check if license plate bbox is inside vehicle bbox
+                    if (lp_x1 >= x1 and lp_y1 >= y1 and lp_x2 <= x2 and lp_y2 <= y2):
+                        matched_plate = lp
+                        break  # stop at first match (you could also keep the highest confidence)
+
+                if matched_plate:
+                    # Crop plate region from original frame
+                    lp_crop = frame[int(matched_plate["bbox"][1]):int(matched_plate["bbox"][3]),
+                                    int(matched_plate["bbox"][0]):int(matched_plate["bbox"][2])]
+                    lp_crop_b64 = self._encode_image_base64(lp_crop)
+
+                    # Add license plate info to this vehicle
+                    item["license_plate"] = {
+                        "text": matched_plate["text"],
+                        "confidence": float(matched_plate["confidence"]),
+                        "bbox": matched_plate["bbox"],
+                        "crop_base64": lp_crop_b64
+                    }
                 response["detected_vehicles"].append(item)
 
-                # Cache minimal det info for skipped frames
-                self._last_dets.append({
-                    "cx": float(cx), "cy": float(cy), "w": float(w), "h": float(h),
-                    "cls": int(cls), "conf": float(conf), "tid": tid,
-                    "color_info": json.dumps(color_info),
-                    "model_info": json.dumps(model_info)
-                })
-
+                
         response["annotated_frame"] = annotated_frame
         response["original_frame"]  = frame
         return response
 
     
     def process_video(self, video_path, result_callback=None,
-                      output_path="output_annotated.mp4",
-                      show_preview=False,
-                      resize_to=None,  
-                      scale=None):      
+                    output_path="output_annotated.mp4",
+                    show_preview=False,
+                    resize_to=None,  
+                    scale=None):      
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise RuntimeError(f"Could not open video: {video_path}")
