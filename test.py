@@ -9,7 +9,6 @@ client = MongoClient("mongodb://localhost:27017")
 db = client["trafficDB"]
 col_videos = db.videos
 col_frames = db.frames
-col_detections = db.detections
 col_tracks = db.tracks
 
 video_path = r"C:\Users\ellio\Downloads\13958312-hd_1920_1080_25fps.mp4"
@@ -42,8 +41,11 @@ video_id = col_videos.insert_one(video_doc).inserted_id
 
 # --- helper: finalize video at end ---
 def _finish_video_doc():
-    col_videos.update_one({"_id": video_id}, {"$set": {"finished_at": datetime.utcnow()}})
-    # compute avg_conf from sum_conf / detections_count (if we used incremental tallies)
+    col_videos.update_one(
+        {"_id": video_id},
+        {"$set": {"finished_at": datetime.utcnow()}}
+    )
+    # compute avg_conf from sum_conf / detections_count
     col_tracks.update_many(
         {"video_id": video_id, "detections_count": {"$gt": 0}},
         [{"$set": {"avg_conf": {"$divide": ["$sum_conf", "$detections_count"]}}}]
@@ -52,6 +54,16 @@ def _finish_video_doc():
 # --- your detector (unchanged) ---
 vehicle_detection = VehicleDetectionTracker(model_path="yolo11n.pt")
 
+# --- helper: update best image per track ---
+def update_best_image(track_doc, tid, b64_img, conf):
+    """Replace best_image only if conf is higher than stored best_conf"""
+    current_conf = track_doc.get("best_conf", -1)
+    if conf > current_conf:
+        col_tracks.update_one(
+            {"video_id": video_id, "track_id": tid},
+            {"$set": {"best_image": b64_img, "best_conf": conf}}
+        )
+
 # --- result callback writes to Mongo ---
 def result_callback(result):
     """
@@ -59,13 +71,21 @@ def result_callback(result):
       "frame_index": int,
       "video_time_seconds": float,
       "number_of_vehicles_detected": int,
-      "detected_vehicles": [{...}]
+      "detected_vehicles": [{
+          "vehicle_id": int,
+          "vehicle_type": str,
+          "detection_confidence": float,
+          "color_info": json string,
+          "model_info": json string,
+          "plate_info": json string,
+          "vehicle_coordinates": {...},
+          "base64_frame": str
+      }]
     }
     """
     fi = result.get("frame_index", 0)
 
     # Only write frames where inference actually ran in your code:
-    # run_inference = (frame_idx % 3 == 0)
     if fi % 3 != 0:
         return
 
@@ -82,42 +102,31 @@ def result_callback(result):
         upsert=True
     )
 
-    # 2) detections (insert_many)
-    det_docs = []
     track_updates = []
     for v in result.get("detected_vehicles", []):
         tid = v.get("vehicle_id")
         coords = v.get("vehicle_coordinates", {}) or {}
-        # detection doc
-        det_docs.append({
-            "video_id": video_id,
-            "frame_index": fi,
-            "track_id": tid,
-            "class": v.get("vehicle_type"),
-            "conf": float(v.get("detection_confidence", 0.0)),
-            "bbox_xywh": {
-                "x": float(coords.get("x", 0.0)),
-                "y": float(coords.get("y", 0.0)),
-                "width": float(coords.get("width", 0.0)),
-                "height": float(coords.get("height", 0.0)),
-            },
-            "centroid": {"x": float(coords.get("x", 0.0)), "y": float(coords.get("y", 0.0))},
-            "color_info": (json.loads(v.get("color_info") or "{}")),
-            "model_info": (json.loads(v.get("model_info") or "{}")),
-        })
+        conf = float(v.get("detection_confidence", 0.0))
 
-        # live track roll-up (skip None track ids)
         if tid is not None:
             color_label = (json.loads(v.get("color_info") or "{}")).get("label")
             model_label = (json.loads(v.get("model_info") or "{}")).get("label")
+            plate_info = json.loads(v.get("plate_info") or "{}")
+            plate_text = plate_info.get("text")
+            plate_conf = float(plate_info.get("conf", 0.0))
+
             inc = {
                 "detections_count": 1,
-                "sum_conf": float(v.get("detection_confidence", 0.0))
+                "sum_conf": conf
             }
             if color_label:
                 inc[f"color_votes.{color_label}"] = 1
             if model_label:
                 inc[f"model_votes.{model_label}"] = 1
+            if plate_text:
+                norm_plate = plate_text.strip().upper().replace(" ", "")
+                inc[f"plate_votes.{norm_plate}.count"] = 1
+                inc[f"plate_votes.{norm_plate}.conf_sum"] = plate_conf
 
             track_updates.append(UpdateOne(
                 {"video_id": video_id, "track_id": tid},
@@ -134,8 +143,12 @@ def result_callback(result):
                 upsert=True
             ))
 
-    if det_docs:
-        col_detections.insert_many(det_docs, ordered=False)
+            # --- update best image in real time ---
+            if v.get("base64_frame"):
+                track_doc = col_tracks.find_one({"video_id": video_id, "track_id": tid})
+                if track_doc:
+                    update_best_image(track_doc, tid, v["base64_frame"], conf)
+
     if track_updates:
         col_tracks.bulk_write(track_updates, ordered=False)
 
