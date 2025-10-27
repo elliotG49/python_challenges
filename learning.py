@@ -1,88 +1,68 @@
-import string
+#
+# example1.py
+#
 
-def count_vowels(string) -> int:
-    vowels = 'aeioui'
-    vowel_count = 0
-    for char in string:
-        if char in vowels:
-            vowel_count += 1
-    return vowel_count
-
-def prime_number(integer) -> bool:
-    prime = True
-    for i in range(2, integer-1):
-        if integer % i == 0:
-            prime = False
-            return prime, i
-    return prime
-        
-
-def reverse_string_without_slicing(string) -> str:
-    new_string = []
-    string  = list(string)
-    for i in range(len(string)):
-        print(string)
-        new_string.append(string[-1])
-        string.pop()
-
-    return new_string
+import threading
+import time
+import multiprocessing
 
 
-
-def rock_paper_scissors() -> str:
-    import random
-    answers = ['rock', 'scissors', 'paper']
-    user_input = str(input('Enter: ')).strip()
-    challenge = random.choice(answers)
-    if user_input not in answers:
-        print('incorrect input')
-        
-def count_words(sentence):
-    new_sentence = sentence.split(' ')
-    print(len(new_sentence))
-
-def sum_of_digits(integer) -> int:
-    return sum([int(d) for d in str(integer)])
-    
-
-def largest_number(n_array) -> int:
-    largest_n = 0
-    for num in n_array:
-        if num > largest_n:
-            largest_n = num
-        else:
-            continue
-    return largest_n
-
-def remove_duplicates(array):
-    return set(array)
-
-def remove_duplicates_without_set(array):
-    seen = []
-    for item in array:
-        if item in seen:
-            continue
-        else:
-            seen.append(item)
-        
-    return seen
+def is_prime(n):
+    """Check if a number is prime."""
+    if n < 2:
+        return False
+    for i in range(2, int(n**0.5) + 1):
+        if n % i == 0:
+            return False
+    return True
 
 
-def find_missing_number(array) -> int:
-    last_number = []
-    for item in array:
-        if not last_number:
-            last_number.append(item)
-        elif item == last_number[0] + 1:
-            last_number.pop()
-            last_number.append(item)
-        else:
-            missing_n = (last_number[0] + 1)
-            return missing_n
+def find_primes(start, end):
+    """Find all prime numbers in the given range."""
+    primes = []
+    for num in range(start, end + 1):
+        if is_prime(num):
+            primes.append(num)
+    return primes
 
-            
-print(find_missing_number([1, 2, 3, 4, 5, 7]))
 
-    
-    
-    
+def worker(worker_id, start, end):
+    """Worker function to find primes in a specific range."""
+    print(f"Worker {worker_id} starting")
+    primes = find_primes(start, end)
+    print(f"Worker {worker_id} found {len(primes)} primes")
+
+
+def main():
+    """Main function to coordinate the multi-threaded prime search."""
+    start_time = time.time()
+
+    # Get the number of CPU cores
+    num_cores = multiprocessing.cpu_count()
+    print(f"Number of CPU cores: {num_cores}")
+
+    # Define the range for prime search
+    total_range = 2_000_000
+    chunk_size = total_range // num_cores
+
+    threads = []
+    # Create and start threads equal to the number of cores
+    for i in range(num_cores):
+        start = i * chunk_size + 1
+        end = (i + 1) * chunk_size if i < num_cores - 1 else total_range
+        thread = threading.Thread(target=worker, args=(i, start, end))
+        threads.append(thread)
+        thread.start()
+
+    # Wait for all threads to complete
+    for thread in threads:
+        thread.join()
+
+    # Calculate and print the total execution time
+    end_time = time.time()
+    total_time = end_time - start_time
+    print(f"All workers completed in {total_time:.2f} seconds")
+
+
+if __name__ == "__main__":
+    main()

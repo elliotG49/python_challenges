@@ -1,166 +1,88 @@
-# --- NEW: add these imports at top of your calling script ---
-from pymongo import MongoClient, UpdateOne
-from bson import ObjectId
-from datetime import datetime
-import cv2, os, json
+from random import randint as rand
+from dataclasses import dataclass
 
-# --- set up Mongo ---
-client = MongoClient("mongodb://localhost:27017")
-db = client["trafficDB"]
-col_videos = db.videos
-col_frames = db.frames
-col_tracks = db.tracks
 
-video_path = r"C:\Users\ellio\Downloads\13958312-hd_1920_1080_25fps.mp4"
-output_path = r"c:\Users\ellio\Videos\output_annotated.avi"
+def make_coordinates() -> tuple[int, int]:
+    x = rand(0, 100)
+    y = rand(0, 100)
+    return (x, y)
 
-# --- probe video to get metadata for the videos doc ---
-cap_probe = cv2.VideoCapture(video_path)
-if not cap_probe.isOpened():
-    raise RuntimeError(f"Could not open video: {video_path}")
-fps = cap_probe.get(cv2.CAP_PROP_FPS) or 25
-ret, first_frame = cap_probe.read()
-cap_probe.release()
-if not ret:
-    raise RuntimeError("Could not read first frame to get dimensions")
-h, w = first_frame.shape[:2]
 
-# --- create videos doc before processing ---
-video_doc = {
-    "path": os.fspath(video_path),
-    "output_path": os.fspath(output_path),
-    "width": int(w),
-    "height": int(h),
-    "fps": float(fps),
-    "model": "yolo11n.pt",
-    "tracker": "bytetrack",
-    "allowed_classes": ["bus","truck","car","bicycle","motorcycle"],
-    "started_at": datetime.utcnow(),
-}
-video_id = col_videos.insert_one(video_doc).inserted_id
+def colors() -> list[str]:
+    colors = ["red", "blue", "yellow", "orange", "black", "white"]
+    r = rand(0, len(colors) - 1)
+    return [colors[r]]
 
-# --- helper: finalize video at end ---
-def _finish_video_doc():
-    col_videos.update_one(
-        {"_id": video_id},
-        {"$set": {"finished_at": datetime.utcnow()}}
-    )
-    # compute avg_conf from sum_conf / detections_count
-    col_tracks.update_many(
-        {"video_id": video_id, "detections_count": {"$gt": 0}},
-        [{"$set": {"avg_conf": {"$divide": ["$sum_conf", "$detections_count"]}}}]
-    )
 
-# --- your detector (unchanged) ---
-vehicle_detection = VehicleDetectionTracker(model_path="yolo11n.pt")
+def vehicle_type() -> list[str]:
+    cars = ["Peugot", "Ford", "Mazda", "BMW", "Mercedes", "Nissan"]
+    r = rand(0, len(cars) - 1)
+    return [cars[r]]
 
-# --- helper: update best image per track ---
-def update_best_image(track_doc, tid, b64_img, conf):
-    """Replace best_image only if conf is higher than stored best_conf"""
-    current_conf = track_doc.get("best_conf", -1)
-    if conf > current_conf:
-        col_tracks.update_one(
-            {"video_id": video_id, "track_id": tid},
-            {"$set": {"best_image": b64_img, "best_conf": conf}}
-        )
 
-# --- result callback writes to Mongo ---
-def result_callback(result):
+class Car:
+    def __init__(self) -> None:
+        print("Car created")
+
+    def __del__(self) -> None:
+        print("Car removed")
+
+
+@dataclass
+class Coordinates:
+    x: int
+    y: int
+
+
+cords = []
+for _ in range(5):
+    c = Coordinates(*make_coordinates())
+    cords.append(c)
+
+p = [c.x for c in cords]
+print(p)
+
+
+def add(*args):
+    m = max(args)
+    return m if m > 1000 else min(args)
+
+
+def show(**kwargs):
+    print(kwargs)
+
+
+word1 = "hello"
+word2 = "world"
+
+
+def xor_words(word1: str, word2: str) -> list[int]:
+    """_summary_
+
+    Args:
+        word1 (str): _description_
+        word2 (str): _description_
+
+    Returns:
+        list[int]: _description_
     """
-    result = {
-      "frame_index": int,
-      "video_time_seconds": float,
-      "number_of_vehicles_detected": int,
-      "detected_vehicles": [{
-          "vehicle_id": int,
-          "vehicle_type": str,
-          "detection_confidence": float,
-          "color_info": json string,
-          "model_info": json string,
-          "plate_info": json string,
-          "vehicle_coordinates": {...},
-          "base64_frame": str
-      }]
-    }
-    """
-    fi = result.get("frame_index", 0)
+    xored = []
+    w1_ord = [ord(char) for char in word1]
+    w2_ord = [ord(char) for char in word2]
 
-    # Only write frames where inference actually ran in your code:
-    if fi % 3 != 0:
-        return
+    print(w1_ord)
+    print(w2_ord)
 
-    # 1) frames (upsert)
-    frame_doc = {
-        "video_id": video_id,
-        "frame_index": fi,
-        "video_time_s": float(result.get("video_time_seconds", 0.0)),
-        "num_detections": int(result.get("number_of_vehicles_detected", 0)),
-    }
-    col_frames.update_one(
-        {"video_id": video_id, "frame_index": fi},
-        {"$set": frame_doc},
-        upsert=True
-    )
+    for i, _ in enumerate(min(w1_ord, w2_ord)):
+        xored.append(w1_ord[i] ^ w2_ord[i])
+    return xored
 
-    track_updates = []
-    for v in result.get("detected_vehicles", []):
-        tid = v.get("vehicle_id")
-        coords = v.get("vehicle_coordinates", {}) or {}
-        conf = float(v.get("detection_confidence", 0.0))
 
-        if tid is not None:
-            color_label = (json.loads(v.get("color_info") or "{}")).get("label")
-            model_label = (json.loads(v.get("model_info") or "{}")).get("label")
-            plate_info = json.loads(v.get("plate_info") or "{}")
-            plate_text = plate_info.get("text")
-            plate_conf = float(plate_info.get("conf", 0.0))
+print(xor_words(word1, word2))
 
-            inc = {
-                "detections_count": 1,
-                "sum_conf": conf
-            }
-            if color_label:
-                inc[f"color_votes.{color_label}"] = 1
-            if model_label:
-                inc[f"model_votes.{model_label}"] = 1
-            if plate_text:
-                norm_plate = plate_text.strip().upper().replace(" ", "")
-                inc[f"plate_votes.{norm_plate}.count"] = 1
-                inc[f"plate_votes.{norm_plate}.conf_sum"] = plate_conf
 
-            track_updates.append(UpdateOne(
-                {"video_id": video_id, "track_id": tid},
-                {
-                    "$setOnInsert": {
-                        "video_id": video_id,
-                        "track_id": tid,
-                        "class": v.get("vehicle_type"),
-                        "first_frame": fi
-                    },
-                    "$max": {"last_frame": fi},
-                    "$inc": inc
-                },
-                upsert=True
-            ))
+tuple = ("Hello", 1, 8.8)
+sets = set()
 
-            # --- update best image in real time ---
-            if v.get("base64_frame"):
-                track_doc = col_tracks.find_one({"video_id": video_id, "track_id": tid})
-                if track_doc:
-                    update_best_image(track_doc, tid, v["base64_frame"], conf)
-
-    if track_updates:
-        col_tracks.bulk_write(track_updates, ordered=False)
-
-# --- run processing ---
-try:
-    vehicle_detection.process_video(
-        video_path,
-        result_callback=result_callback,
-        output_path=output_path,
-        show_preview=True
-    )
-finally:
-    _finish_video_doc()
-
-print(f"Saved annotated video to: {output_path}\nvideo_id = {video_id}")
+print(type(tuple))
+print(type(sets))
